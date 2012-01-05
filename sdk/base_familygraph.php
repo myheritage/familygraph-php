@@ -38,7 +38,7 @@ abstract class BaseFamilyGraph
     /**
      * Version.
      */
-    const VERSION = '0.0.1';
+    const VERSION = '0.0.2';
 
     /**
      * Default options for curl.
@@ -46,9 +46,9 @@ abstract class BaseFamilyGraph
     public static $CURL_OPTS = array(
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 60,
-        CURLOPT_ENCODING => '', // Empty string means all supported encodings
-        CURLOPT_USERAGENT => 'familygraph-php-0.0.1',
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_ENCODING       => '', // Empty string means all supported encodings
+        CURLOPT_USERAGENT      => 'familygraph-php-0.0.2',
     );
 
     /**
@@ -211,13 +211,15 @@ abstract class BaseFamilyGraph
     {
         $code = $this->getCode();
         if ($code && $code != $this->getPersistentData('code')) {
-            $accessToken = $this->getAccessTokenFromCode($code);
-            if ($accessToken) {
+            $accessTokenFromCode = $this->getAccessTokenFromCode($code);
+            if ($accessTokenFromCode) {
                 $this->setPersistentData('code', $code);
-                $this->setPersistentData('access_token', $accessToken);
-                return $accessToken;
+                $this->setPersistentData('access_token', $accessTokenFromCode['access_token']);
+                $this->setPersistentData('expires_in', $accessTokenFromCode['expires_in']);
+                $this->setPersistentData('refresh_token', $accessTokenFromCode['refresh_token']);
+                return $accessTokenFromCode['access_token'];
             }
-
+            
             // code was bogus, so everything based on it should be invalidated.
             $this->clearAllPersistentData();
             return null;
@@ -336,15 +338,41 @@ abstract class BaseFamilyGraph
             }
         }
 
-        $taken = -microtime(true);
+//        $taken = -microtime(true);
         $result = $this->_oauthRequest(
-                $this->getUrl('familygraph', $path),
-                $params
+            $this->getUrl('familygraph', $path),
+            $params
         );
-		$taken += microtime(true);
-//		echo "$taken\tCall to $path with params = ", print_r($params), "<br>\n";
+//        $taken += microtime(true);
+//        echo "$taken\tCall to $path with params = ", print_r($params), "<br>\n";
 
         return $result;
+    }
+    
+    /**
+     * Refreshes the access token using the current refresh token
+     * 
+     * @return string|null the new access token on success, null otherwise
+     */
+    public function refreshAccessToken()
+    {
+        $refreshToken = $this->getPersistentData('refresh_token');
+        if (!$refreshToken) {
+            return null;
+        }
+
+        $accessTokenFromRefreshToken = $this->getAccessTokenFromRefreshToken($refreshToken);
+        if (!$accessTokenFromRefreshToken) {
+            // code was bogus, so everything based on it should be invalidated.
+            $this->clearAllPersistentData();
+            return null;
+        }
+        
+        $this->setPersistentData('access_token', $accessTokenFromRefreshToken['access_token']);
+        $this->setPersistentData('expires_in', $accessTokenFromRefreshToken['expires_in']);
+        $this->setPersistentData('refresh_token', $accessTokenFromRefreshToken['refresh_token']);
+        
+        return $this->getPersistentData('access_token');
     }
 
     /**
@@ -409,6 +437,53 @@ abstract class BaseFamilyGraph
     }
 
     /**
+     * Gets an access token for the given refresh token
+     * (previously generated from myheritage.com on behalf of
+     * a specific user). The refresh token is sent to accounts.myheritage.com
+     * and a legitimate access token and refresh token are generated provided the access token
+     * and the user for which it was generated all match, and the user is
+     * either logged in to MyHeritage or has granted an offline access permission.
+     *
+     * @param string $refreshToken refresh token
+     * @return array An access token (associative array with access_token, expires_in, refresh_token)
+     *               exchanged for the refresh token, or empty array if an access token could
+     *               not be generated.
+     */
+    protected function getAccessTokenFromRefreshToken($refreshToken)
+    {
+        if (empty($refreshToken)) {
+            return array();
+        }
+
+        try {
+            // need to circumvent json_decode by calling _oauthRequest
+            // directly, since response isn't JSON format.
+            $result = $this->makeRequest(
+                $this->getUrl('accounts', 'oauth2/token'),
+                'POST',
+                array(
+                    'grant_type' => 'refresh_token',
+                    'client_id' => $this->getClientId(),
+                    'client_secret' => $this->getClientSecret(),
+                    'refresh_token' => $refreshToken
+                )
+            );
+        } catch (FamilyGraphException $ex) {
+            // most likely that user very recently revoked authorization.
+            // In any event, we don't have an access token, so say so.
+            self::errorLog("Failed to convert refresh token to access token: " . $ex->__toString());
+            return false;
+        }
+
+        if (!isset($result['access_token'], $result['expires_in'], $result['refresh_token'])) {
+            self::errorLog("Could not exchange refresh token for access token. Result: '" . print_r($result, true) . "'");
+            return false;
+        }
+        
+        return $result;
+    }
+
+    /**
      * Retrieves an access token for the given authorization code
      * (previously generated from myheritage.com on behalf of
      * a specific user).  The authorization code is sent to accounts.myheritage.com
@@ -417,13 +492,14 @@ abstract class BaseFamilyGraph
      * either logged in to MyHeritage or has granted an offline access permission.
      *
      * @param string $code An authorization code.
-     * @return mixed An access token exchanged for the authorization code, or
-     *               false if an access token could not be generated.
+     * @return array An access token (associative array with access_token, expires_in, refresh_token)
+     *               exchanged for the authorization code, or empty array if an access token could
+     *               not be generated.
      */
     protected function getAccessTokenFromCode($code)
     {
         if (empty($code)) {
-            return false;
+            return array();
         }
 
         try {
@@ -447,12 +523,12 @@ abstract class BaseFamilyGraph
             return false;
         }
 
-        if (!isset($result['access_token'])) {
+        if (!isset($result['access_token'], $result['expires_in'], $result['refresh_token'])) {
             self::errorLog("Could not exchange code for access token. Result: '" . print_r($result, true) . "'");
             return false;
         }
         
-        return $result['access_token'];
+        return $result;
     }
 
     /**
@@ -483,7 +559,7 @@ abstract class BaseFamilyGraph
         return $this->makeRequest($url, 'GET', $params, $headers);
     }
 
-	private $curl = null;
+    private $curl = null;
 
     /**
      * Makes an HTTP request. This method can be overridden by subclasses if
@@ -491,7 +567,7 @@ abstract class BaseFamilyGraph
      * make the request.
      *
      * @param string $url The URL to make the request to
-     * @param string $method GET or post
+     * @param string $method GET or POST
      * @param array $params The parameters to use
      * @param array $headers HTTP headers to send
      *
@@ -501,34 +577,42 @@ abstract class BaseFamilyGraph
     protected function makeRequest($url, $method = 'GET', $params = array(), $headers = array())
     {
         //var_dump($url); var_dump($params);
-		if ($this->curl == null) {
-			$this->curl = curl_init();
-		}
-		$ch = $this->curl;
-		
+        if ($this->curl == null) {
+            $this->curl = curl_init();
+        }
+        $ch = $this->curl;
+
         curl_setopt($ch, CURLOPT_CAINFO, dirname(__FILE__) . '/cacert.pem');
 
 //        $debugHandle = fopen('/tmp/fgsdk.out', 'a');
 //        curl_setopt($ch, CURLOPT_STDERR, $debugHandle);
 //        curl_setopt($ch, CURLOPT_VERBOSE, true);
 
-        $opts = self::$CURL_OPTS;
-
-        if (count($params) > 0) {
+        // check if the request length is too long for GET method, if so use POST instead
+        $urlForGetRequest = '';
+        if ($method == 'GET') {
             $queryString = http_build_query($params, null, '&');
-            if ($method == 'GET') {
-                $url .= ((strpos($url, '?') === false) ? '?' : '&') . $queryString;
-            } else {
-                $opts[CURLOPT_POSTFIELDS] = $queryString;
+            $urlForGetRequest = $url . ((strpos($url, '?') === false) ? '?' : '&') . $queryString;
+            
+            // note: the limit on MyHeritage servers for GET requests is 8192
+            if (mb_strlen($urlForGetRequest) > 8000) {
+                $method = 'POST';
             }
         }
-
-        if (count($headers) > 0) {
-//            fwrite($debugHandle, print_r($headers, true));
-            $opts[CURLOPT_HTTPHEADER] = $headers;
+        
+        $opts = self::$CURL_OPTS;
+        $opts[CURLOPT_CUSTOMREQUEST] = $method;
+        if ($method == 'GET') {
+            $opts[CURLOPT_POSTFIELDS] = array();
+            $url = $urlForGetRequest;
+        } else {
+            $opts[CURLOPT_POSTFIELDS] = $params;
         }
+        
+//        fwrite($debugHandle, print_r($headers, true));
+        $opts[CURLOPT_HTTPHEADER] = $headers;
 
-		//echo "cURL $url with headers:" , print_r($headers, true), "<br>\n";
+        //echo "cURL $url with headers:" , print_r($headers, true), "<br>\n";
 
         $opts[CURLOPT_URL] = $url;
 
@@ -544,13 +628,14 @@ abstract class BaseFamilyGraph
 
         curl_setopt_array($ch, $opts);
         $output = curl_exec($ch);
-        
+//        echo $output;
+
         if ($output === false) {
             $ex = new FamilyGraphException(curl_error($ch), 'CurlError', curl_errno($ch));
             curl_close($ch);
             throw $ex;
         }
-        //curl_close($ch);
+//        curl_close($ch);
 
         $result = json_decode($output, true);
         if ($result === null) {
@@ -573,7 +658,7 @@ abstract class BaseFamilyGraph
             $ex->setRawData($result);
             throw $ex;
         }
-
+        
         return $result;
     }
 
